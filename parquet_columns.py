@@ -1,9 +1,46 @@
 import duckdb
 import os
+import csv
+from pathlib import Path
+
+def save_schema_to_csv(conn, table_name, output_file):
+    # Create schemas directory if it doesn't exist
+    Path('schemas').mkdir(exist_ok=True)
+    
+    try:
+        # Get first row of data
+        result = conn.execute(f"""
+            SELECT *
+            FROM {table_name}
+            LIMIT 1
+        """).fetchone()
+        
+        if result is None:
+            print(f"No data found in {table_name}")
+            return
+        
+        # Get column names
+        columns = conn.execute(f"DESCRIBE SELECT * FROM {table_name}").fetchall()
+        column_names = [col[0] for col in columns]
+        
+        # Create schema file with column names and example values
+        with open(f'schemas/{output_file}', 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Column Name', 'Example Value'])
+            
+            for col_name, value in zip(column_names, result):
+                if value is not None:
+                    writer.writerow([col_name, value])
+    
+    except Exception as e:
+        print(f"An error occurred while saving schema: {e}")
 
 def get_parquet_info():
     # Connect to DuckDB
     conn = duckdb.connect()
+    
+    # Create input_schemas directory if it doesn't exist
+    Path('input_schemas').mkdir(exist_ok=True)
     
     # URL of the Parquet file
     parquet_url = "https://huggingface.co/datasets/openfoodfacts/product-database/resolve/main/food.parquet"
@@ -18,10 +55,10 @@ def get_parquet_info():
             LIMIT 100
         """, [parquet_url])
         
-        # Save the sample as a local CSV file
-        print("Saving sample to food_sample.csv...")
+        # Save the sample as a local CSV file in input_schemas
+        print("Saving sample to input_schemas/food_sample.csv...")
         conn.execute("""
-            COPY food_sample TO 'food_sample.csv' (FORMAT CSV, HEADER)
+            COPY food_sample TO 'input_schemas/food_sample.csv' (FORMAT CSV, HEADER)
         """)
         
         # Get column names from the sample
@@ -33,6 +70,9 @@ def get_parquet_info():
         for i, col in enumerate(column_names, 1):
             print(f"{i}. {col}")
             
+        # Save original schema
+        save_schema_to_csv(conn, 'food_sample', 'original_schema.csv')
+        
         return column_names
         
     except Exception as e:
@@ -51,7 +91,7 @@ def print_product_info(code="0000101209159"):
         print(f"\nLooking up product code: {code}")
         result = conn.execute("""
             SELECT *
-            FROM read_csv('food_sample.csv')
+            FROM read_csv('input_schemas/food_sample.csv')
             WHERE code = $1
         """, [code]).fetchone()
         
@@ -60,7 +100,7 @@ def print_product_info(code="0000101209159"):
             return
         
         # Get column names
-        columns = conn.execute("DESCRIBE SELECT * FROM read_csv('food_sample.csv')").fetchall()
+        columns = conn.execute("DESCRIBE SELECT * FROM read_csv('input_schemas/food_sample.csv')").fetchall()
         column_names = [col[0] for col in columns]
         
         # Print each property and its value
@@ -75,7 +115,7 @@ def print_product_info(code="0000101209159"):
     finally:
         conn.close()
 
-def print_first_row(csv_file='food_sample_target.csv'):
+def print_first_row(csv_file='input_schemas/food_sample_target.csv'):
     # Connect to DuckDB
     conn = duckdb.connect()
     
@@ -168,12 +208,34 @@ def transform_and_save_sample():
                 manufacturing_places_tags,
                 labels,
                 labels_tags,
-                labels_tags as labels_en,
+                -- Extract only English labels
+                CASE 
+                    WHEN labels_tags IS NOT NULL AND labels_tags != ''
+                    THEN list_transform(
+                        list_filter(
+                            string_split(TRIM(BOTH '[]' FROM labels_tags), ','), 
+                            x -> TRIM(x) LIKE 'en:%'
+                        ),
+                        x -> '"' || TRIM(REPLACE(TRIM(x), 'en:', '')) || '"'
+                    )::STRING
+                    ELSE '[]'
+                END as labels_en,
                 emb_codes,
                 emb_codes_tags,
                 'en:france' as countries,
                 countries_tags,
-                countries_tags as countries_en,
+                -- Extract only English countries
+                CASE 
+                    WHEN countries_tags IS NOT NULL AND countries_tags != ''
+                    THEN list_transform(
+                        list_filter(
+                            string_split(TRIM(BOTH '[]' FROM countries_tags), ','), 
+                            x -> TRIM(x) LIKE 'en:%'
+                        ),
+                        x -> '"' || TRIM(REPLACE(TRIM(x), 'en:', '')) || '"'
+                    )::STRING
+                    ELSE '[]'
+                END as countries_en,
                 COALESCE(ingredients_text, '') as ingredients_text,
                 0 as additives_n,
                 -- Handle JSON arrays more safely
@@ -186,16 +248,44 @@ def transform_and_save_sample():
                 'unknown' as pnns_groups_2,
                 CASE 
                     WHEN food_groups_tags IS NOT NULL AND food_groups_tags != ''
-                    THEN COALESCE(TRY_CAST(food_groups_tags AS JSON), '[]')::JSON->0
-                    ELSE ''
-                END as food_groups,
+                    THEN list_transform(
+                        list_filter(
+                            string_split(TRIM(BOTH '[]' FROM food_groups_tags), ','), 
+                            x -> TRIM(x) LIKE 'en:%'
+                        ),
+                        x -> '"' || TRIM(REPLACE(TRIM(x), 'en:', '')) || '"'
+                    )::STRING
+                    ELSE '[]'
+                END as food_groups_en,
                 food_groups_tags,
-                food_groups_tags as food_groups_en,
                 states_tags,
                 states_tags,
-                states_tags as states_en,
+                -- Extract only English states
+                CASE 
+                    WHEN states_tags IS NOT NULL AND states_tags != ''
+                    THEN list_transform(
+                        list_filter(
+                            string_split(TRIM(BOTH '[]' FROM states_tags), ','), 
+                            x -> TRIM(x) LIKE 'en:%'
+                        ),
+                        x -> '"' || TRIM(REPLACE(TRIM(x), 'en:', '')) || '"'
+                    )::STRING
+                    ELSE '[]'
+                END as states_en,
                 CAST(ecoscore_score AS INTEGER) as ecoscore_score,
                 ecoscore_grade,
+                -- Add stores fields
+                stores,
+                stores_tags,
+                -- Transform stores (no en: prefix filtering needed)
+                CASE 
+                    WHEN stores_tags IS NOT NULL AND stores_tags != ''
+                    THEN list_transform(
+                        string_split(TRIM(BOTH '[]' FROM stores_tags), ','),
+                        x -> '"' || TRIM(x) || '"'
+                    )::STRING
+                    ELSE '[]'
+                END as stores_en,
                 -- Handle quantity conversion more safely
                 CASE 
                     WHEN quantity IS NOT NULL AND quantity != ''
@@ -206,15 +296,18 @@ def transform_and_save_sample():
                 completeness,
                 CAST(last_image_t AS BIGINT) as last_image_t,
                 last_image_t::STRING as last_image_datetime
-            FROM read_csv('food_sample.csv')
+            FROM read_csv('input_schemas/food_sample.csv')
         """)
         
         # Save the transformed data
-        print("Saving transformed data to food_sample_transformed.csv...")
+        print("Saving transformed data to input_schemas/food_sample_transformed.csv...")
         conn.execute("""
-            COPY transformed_sample TO 'food_sample_transformed.csv' 
+            COPY transformed_sample TO 'input_schemas/food_sample_transformed.csv' 
             (FORMAT CSV, HEADER)
         """)
+        
+        # Save transformed schema
+        save_schema_to_csv(conn, 'transformed_sample', 'transformed_schema.csv')
         
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -222,11 +315,20 @@ def transform_and_save_sample():
     finally:
         conn.close()
 
+def save_target_schema():
+    conn = duckdb.connect()
+    try:
+        # Save target schema from input_schemas directory
+        save_schema_to_csv(conn, "read_csv('input_schemas/food_sample_target.csv')", 'target_schema.csv')
+    finally:
+        conn.close()
+
 if __name__ == "__main__":
     # First ensure we have the source data
-    if not os.path.exists('food_sample.csv'):
+    if not os.path.exists('input_schemas/food_sample.csv'):
         print("Creating initial sample file...")
         get_parquet_info()
     
     transform_and_save_sample()
-    print_first_row('food_sample_transformed.csv') 
+    save_target_schema()
+    print_first_row('input_schemas/food_sample_transformed.csv') 
