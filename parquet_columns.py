@@ -149,7 +149,18 @@ def transform_and_save_sample():
                 brands_tags,
                 categories,
                 categories_tags,
-                categories_tags as categories_en,
+                -- Extract only English categories and remove 'en:' prefix
+                CASE 
+                    WHEN categories_tags IS NOT NULL AND categories_tags != ''
+                    THEN list_transform(
+                        list_filter(
+                            string_split(TRIM(BOTH '[]' FROM categories_tags), ','), 
+                            x -> TRIM(x) LIKE 'en:%'
+                        ),
+                        x -> '"' || TRIM(REPLACE(TRIM(x), 'en:', '')) || '"'
+                    )::STRING
+                    ELSE '[]'
+                END as categories_en,
                 '' as origins,
                 origins_tags,
                 origins_tags as origins_en,
